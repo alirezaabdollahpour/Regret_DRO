@@ -7,7 +7,6 @@ from pathlib import Path
 from unittest import mock
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 import Multiclass_classification as experiment
@@ -81,7 +80,7 @@ class ClassifierSmokeTests(unittest.TestCase):
         expected = copy.deepcopy(actual)
         optimizer = torch.optim.Adam(expected.parameters(), lr=0.001, weight_decay=0.0)
         weight = expected.linear.weight
-        loss = F.cross_entropy(expected(features), labels)
+        loss = experiment.cross_entropy(expected(features), labels)
         loss = loss + 0.7 * torch.linalg.eigvalsh(weight @ weight.T)[-1]
         self.assertTrue(torch.isfinite(loss))
         loss.backward()

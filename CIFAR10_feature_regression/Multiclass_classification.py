@@ -16,6 +16,8 @@ from typing import Tuple, List
 
 import matplotlib.pyplot as plt
 
+from corrected_cross_entropy import CrossEntropyLoss, cross_entropy, LOSS_IMPLEMENTATION
+
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -59,7 +61,7 @@ def pgd_attack(model, features, labels, epsilon, alpha=None, num_iter=10,
             for _ in range(num_iter):
                 with torch.enable_grad():
                     perturbed = perturbed.detach().requires_grad_(True)
-                    loss = nn.functional.cross_entropy(model(perturbed), labels)
+                    loss = cross_entropy(model(perturbed), labels)
                     grad, = torch.autograd.grad(loss, perturbed)
                 with torch.no_grad():
                     if not torch.isfinite(grad).all():
@@ -123,7 +125,7 @@ class BaseLinearDRO:
         return float(np.mean(y.flatten() == np.argmax(self.predict(X), axis=1)))
     
     def _compute_loss(self, predictions, targets, m, lambda_reg):
-        criterion = nn.CrossEntropyLoss(reduction='none')
+        criterion = CrossEntropyLoss(reduction='none')
         residuals = criterion(predictions, targets) / max(lambda_reg, 1e-8)
         residual_matrix = residuals.view(-1, m).T
         return torch.mean(torch.logsumexp(residual_matrix, dim=0) - math.log(m)) * lambda_reg
@@ -136,7 +138,7 @@ class BaseLinearDRO:
         repeated_target = targets.repeat_interleave(m, dim=0)
         
         predictions = self.model(noisy_data)
-        criterion = nn.CrossEntropyLoss(reduction='none')
+        criterion = CrossEntropyLoss(reduction='none')
         residuals = criterion(predictions, repeated_target) / max(lam * epsilon, 1e-8)
         residual_matrix = residuals.view(-1, m).T
         return torch.mean(torch.logsumexp(residual_matrix, dim=0) - math.log(m)) * lam * epsilon
@@ -200,7 +202,7 @@ class SDRO_RGO(BaseLinearDRO):
         self.rgo_vectorized_max_trials = 100 
         self.model = LinearModel(self.input_dim, output_dim=self.num_classes, bias=self.fit_intercept).to(self.device)
     def _get_model_loss_value_batched(self, x_features_batch: torch.Tensor, y_target_batch: torch.Tensor, model_instance: nn.Module) -> torch.Tensor:
-        return nn.CrossEntropyLoss(reduction='none')(model_instance(x_features_batch), y_target_batch)
+        return CrossEntropyLoss(reduction='none')(model_instance(x_features_batch), y_target_batch)
     def _rgo_sampler_vectorized(self, x_original_batch: torch.Tensor, y_original_batch: torch.Tensor, current_model_state: nn.Module, num_samples_to_generate: int, epoch: int) -> torch.Tensor:
         batch_size = x_original_batch.size(0)
         x_orig_detached_batch = x_original_batch.detach()
@@ -256,7 +258,7 @@ class SDRO_RGO(BaseLinearDRO):
                 y_repeated_batch = y_original_batch_dev.repeat_interleave(self.num_samples, dim=0)
                 self.model.train()
                 predictions_logits_batch = self.model(x_rgo_batch)
-                optimization_loss = nn.CrossEntropyLoss()(predictions_logits_batch, y_repeated_batch)
+                optimization_loss = CrossEntropyLoss()(predictions_logits_batch, y_repeated_batch)
                 optimizer_theta.zero_grad()
                 optimization_loss.backward()
                 optimizer_theta.step()
@@ -279,7 +281,7 @@ class SDRO_WFR(BaseLinearDRO):
         self.num_samples, self.max_itr, self.learning_rate, self.batch_size = num_samples, max_itr, learning_rate, batch_size
         self.model = LinearModel(self.input_dim, output_dim=self.num_classes, bias=self.fit_intercept).to(self.device)
     def _get_model_loss_value_batched(self, x_features_batch: torch.Tensor, y_target_batch: torch.Tensor, model_instance: nn.Module) -> torch.Tensor:
-        return nn.CrossEntropyLoss(reduction='none')(model_instance(x_features_batch), y_target_batch)
+        return CrossEntropyLoss(reduction='none')(model_instance(x_features_batch), y_target_batch)
     def _WFR_sampler(self, x_orig: torch.Tensor, y_orig: torch.Tensor, model: nn.Module, epoch) -> torch.Tensor:
         batch_size = x_orig.shape[0]
 
@@ -297,7 +299,7 @@ class SDRO_WFR(BaseLinearDRO):
         for _ in range(num_steps):
             x_clone.requires_grad_(True)
             
-            loss_values = nn.CrossEntropyLoss(reduction='none')(model(x_clone), y_repeated)
+            loss_values = CrossEntropyLoss(reduction='none')(model(x_clone), y_repeated)
             grads, = torch.autograd.grad(loss_values, x_clone, grad_outputs=torch.ones_like(loss_values))
             x_clone = x_clone.detach()
             
@@ -308,7 +310,7 @@ class SDRO_WFR(BaseLinearDRO):
             x_clone = mean + noise
 
             with torch.no_grad():
-                current_loss = nn.CrossEntropyLoss(reduction='none')(model(x_clone), y_repeated).view(batch_size, -1)
+                current_loss = CrossEntropyLoss(reduction='none')(model(x_clone), y_repeated).view(batch_size, -1)
                 dist_sq = torch.sum((x_clone - x_original_expanded) ** 2, dim=1).view(batch_size, -1)
                 
                 energy_term = current_loss - 2 * self.lambda_param * dist_sq
@@ -358,7 +360,7 @@ class SDRO_WFR(BaseLinearDRO):
                 y_repeated_batch = y_original_batch_dev.repeat_interleave(self.num_samples, dim=0)
                 self.model.train()
                 predictions_logits_batch = self.model(x_WFR_batch)
-                loss_values = nn.CrossEntropyLoss(reduction='none')(predictions_logits_batch, y_repeated_batch)
+                loss_values = CrossEntropyLoss(reduction='none')(predictions_logits_batch, y_repeated_batch)
                 optimization_loss = (loss_values.view(-1, self.num_samples) * weights).sum(dim=1).mean()
                 optimizer_theta.zero_grad()
                 optimization_loss.backward()
@@ -382,7 +384,7 @@ class SDRO_WGF(BaseLinearDRO):
         self.num_samples, self.max_itr, self.learning_rate, self.batch_size = num_samples, max_itr, learning_rate, batch_size
         self.model = LinearModel(self.input_dim, output_dim=self.num_classes, bias=self.fit_intercept).to(self.device)
     def _get_model_loss_value_batched(self, x_features_batch: torch.Tensor, y_target_batch: torch.Tensor, model_instance: nn.Module) -> torch.Tensor:
-        return nn.CrossEntropyLoss(reduction='none')(model_instance(x_features_batch), y_target_batch)
+        return CrossEntropyLoss(reduction='none')(model_instance(x_features_batch), y_target_batch)
     def _WGF_sampler(self, x_orig: torch.Tensor, y_orig: torch.Tensor, model: nn.Module, epoch) -> torch.Tensor:
         x_clone = x_orig.clone().detach().requires_grad_(True)
         x_clone = x_clone.unsqueeze(1).expand(-1, self.num_samples, -1).contiguous().view(-1, self.input_dim)
@@ -391,7 +393,7 @@ class SDRO_WGF(BaseLinearDRO):
         num_steps = int(max(5, self.inner_itr * (epoch + 1) / self.max_itr))
         for _ in range(num_steps):
             x_clone.requires_grad_(True)
-            loss_values = nn.CrossEntropyLoss(reduction='none')(model(x_clone), y_repeated)
+            loss_values = CrossEntropyLoss(reduction='none')(model(x_clone), y_repeated)
             grads, = torch.autograd.grad(loss_values, x_clone, grad_outputs=torch.ones_like(loss_values))
             x_clone = x_clone.detach()
             
@@ -417,7 +419,7 @@ class SDRO_WGF(BaseLinearDRO):
                 y_repeated_batch = y_original_batch_dev.repeat_interleave(self.num_samples, dim=0)
                 self.model.train()
                 predictions_logits_batch = self.model(x_WGF_batch)
-                optimization_loss = nn.CrossEntropyLoss()(predictions_logits_batch, y_repeated_batch)
+                optimization_loss = CrossEntropyLoss()(predictions_logits_batch, y_repeated_batch)
                 optimizer_theta.zero_grad()
                 optimization_loss.backward()
                 optimizer_theta.step()
@@ -478,7 +480,7 @@ class SDRO_SVG(BaseLinearDRO):
             x_tensor = particles.view(B * S, D).clone().requires_grad_(True)
             x_orig_repeated_flat = x_orig_repeated.view(B * S, D)
 
-            neg_log_likelihood = nn.CrossEntropyLoss(reduction='sum')(model(x_tensor), y_repeated)
+            neg_log_likelihood = CrossEntropyLoss(reduction='sum')(model(x_tensor), y_repeated)
             grad_log_py_x, = torch.autograd.grad(outputs=neg_log_likelihood, inputs=x_tensor)
             
             grad_log_px = -2 * self.lambda_param * (x_tensor - x_orig_repeated_flat)
@@ -519,7 +521,7 @@ class SDRO_SVG(BaseLinearDRO):
                 
                 self.model.train()
                 predictions_logits_batch = self.model(x_svg_batch)
-                optimization_loss = nn.CrossEntropyLoss()(predictions_logits_batch, y_repeated_batch)
+                optimization_loss = CrossEntropyLoss()(predictions_logits_batch, y_repeated_batch)
                 
                 optimizer_theta.zero_grad()
                 optimization_loss.backward()
@@ -544,12 +546,12 @@ class WRM(BaseLinearDRO):
         self.max_itr, self.learning_rate, self.batch_size = max_itr, learning_rate, batch_size 
         self.model = LinearModel(self.input_dim, output_dim=self.num_classes, bias=self.fit_intercept).to(self.device)
     def _get_model_loss_value_batched(self, x_features_batch: torch.Tensor, y_target_batch: torch.Tensor, model_instance: nn.Module) -> torch.Tensor:
-        return nn.CrossEntropyLoss(reduction='none')(model_instance(x_features_batch), y_target_batch)
+        return CrossEntropyLoss(reduction='none')(model_instance(x_features_batch), y_target_batch)
     def _sinha_sampler(self, x_orig: torch.Tensor, y_orig: torch.Tensor, model: nn.Module, epoch) -> torch.Tensor:
         x_clone = x_orig.clone().detach().requires_grad_(True)
         num_steps = int(max(5, self.inner_itr * (epoch + 1) / self.max_itr))
         for _ in range(num_steps):
-            loss_values = nn.CrossEntropyLoss(reduction='none')(model(x_clone), y_orig)
+            loss_values = CrossEntropyLoss(reduction='none')(model(x_clone), y_orig)
             grads, = torch.autograd.grad(loss_values, x_clone, grad_outputs=torch.ones_like(loss_values))
             x_clone = x_clone.detach() + self.inner_lr * (grads - 2*self.lambda_param*(x_clone - x_orig))
             x_clone.requires_grad_(True)
@@ -568,12 +570,12 @@ class WRM(BaseLinearDRO):
                 x_WRM_batch = self._sinha_sampler(x_original_batch_dev, y_original_batch_dev, self.model, epoch)
                 self.model.train()
                 predictions_logits_batch = self.model(x_WRM_batch)
-                optimization_loss = nn.CrossEntropyLoss()(predictions_logits_batch, y_original_batch_dev)
+                optimization_loss = CrossEntropyLoss()(predictions_logits_batch, y_original_batch_dev)
                 optimizer_theta.zero_grad()
                 optimization_loss.backward()
                 optimizer_theta.step()
                 with torch.no_grad():
-                    comparable_loss = nn.CrossEntropyLoss()(self.model(x_original_batch_dev), y_original_batch_dev)
+                    comparable_loss = CrossEntropyLoss()(self.model(x_original_batch_dev), y_original_batch_dev)
                 epoch_loss_record += comparable_loss.item()
                 pbar.set_postfix(optim_loss=optimization_loss.item(), record_loss=comparable_loss.item())
             avg_epoch_loss_record = epoch_loss_record / len(dataloader)
@@ -599,7 +601,7 @@ def _train_clean_head(model, train_loader, epochs, learning_rate, checkpoint_dir
         for features, labels in pbar:
             features, labels = features.to(device), labels.to(device)
             optimizer.zero_grad()
-            clean_ce = nn.functional.cross_entropy(model(features), labels)
+            clean_ce = cross_entropy(model(features), labels)
             loss = clean_ce
             if method == "SNR":
                 W = model.linear.weight
@@ -659,7 +661,7 @@ def clean_objective_metrics(model, features, labels, snr_lambda, batch_size=128)
     ce_sum = 0.0
     with torch.no_grad():
         for x, y in DataLoader(TensorDataset(features, labels), batch_size=batch_size):
-            ce_sum += nn.functional.cross_entropy(model(x.to(device)), y.to(device),
+            ce_sum += cross_entropy(model(x.to(device)), y.to(device),
                                                   reduction="sum").item()
         W = model.linear.weight
         penalty = torch.linalg.eigvalsh(W @ W.T)[-1].item()
@@ -795,6 +797,7 @@ def plot_comparison(records, methods, levels, radii, output_dir):
 METHODS = ("SAA", "SNR", "Dual", "WGF", "WRM", "WFR", "SVG", "RGO")
 CSV_FIELDS = ["method", "configuration", "seed", "mean_test_norm", "relative_level",
               "absolute_radius", "clean_accuracy", "pgd_accuracy", "metric",
+              "cross_entropy",
               "snr_lambda", "lambda_param", "epsilon", "learning_rate", "batch_size",
               "epochs", "weight_decay", "pgd_steps", "pgd_step_size", "clean_ce",
               "spectral_penalty", "weighted_spectral_penalty", "total_objective",
@@ -824,6 +827,7 @@ def run_experiment(args):
     print(f"Outputs: {run_dir.resolve()}")
     with (run_dir / "experiment.json").open("w") as stream:
         json.dump({"arguments": vars(args), "feature_metadata": FEATURE_METADATA,
+                   "cross_entropy": LOSS_IMPLEMENTATION,
                    "mean_test_norm": mean_test_norm, "levels": levels,
                    "metric": "feature-space PGD accuracy",
                    "snr_diagnostics": "final full-training clean CE; spectral_penalty is ||W||_op squared"},
@@ -865,7 +869,8 @@ def run_experiment(args):
 
         clean_hp = {"optimizer": "Adam", "learning_rate": 0.001, "batch_size": args.batch_size,
                     "epochs": args.epochs, "weight_decay": 0.0, "betas": [0.9, 0.999],
-                    "adam_eps": 1e-8, "bias": True, "feature_dim": 512, "num_classes": 10}
+                    "adam_eps": 1e-8, "bias": True, "feature_dim": 512, "num_classes": 10,
+                    "cross_entropy": LOSS_IMPLEMENTATION}
         print(f"Paired SAA/SNR settings: {json.dumps(clean_hp, sort_keys=True)}")
         # Each seed has one initial head and independent, identically seeded loaders.
         for seed in args.seeds:
@@ -912,7 +917,8 @@ def run_experiment(args):
                     hp = {**params, "epochs": args.epochs, "optimizer": "Adam",
                           "weight_decay": 0.0 if method == "Dual" else 1e-4,
                           "betas": [0.9, 0.999], "adam_eps": 1e-8,
-                          "bias": True, "feature_dim": 512, "num_classes": 10}
+                          "bias": True, "feature_dim": 512, "num_classes": 10,
+                          "cross_entropy": LOSS_IMPLEMENTATION}
                     for seed in args.seeds:
                         torch.manual_seed(seed)
                         np.random.seed(seed)
@@ -974,7 +980,7 @@ def main():
     parser.add_argument("--output-dir", default="results/cifar10_resnet18")
     parser.add_argument("--feature-batch-size", type=positive_int, default=128)
     parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--smoke-test", action="store_true", help="Run synthetic CPU tests without downloads.")
+    parser.add_argument("--smoke-test", action="store_true", help="Run synthetic tests without downloads; check CUDA if available.")
     args = parser.parse_args()
     if args.smoke_test:
         import unittest

@@ -40,6 +40,7 @@ class ExperimentIntegrationTests(unittest.TestCase):
                 sdro_epsilons=[0.02, 0.002], snr_lambda=0.01, pgd_steps=10,
             )
             with mock.patch.object(experiment, "load_or_extract_features", return_value=data), \
+                    mock.patch("torch.nn.functional.cross_entropy", side_effect=AssertionError("Standard CE was called")), \
                     mock.patch.object(experiment, "train_saa", wraps=experiment.train_saa) as saa, \
                     mock.patch.object(experiment, "train_snr", wraps=experiment.train_snr) as snr, \
                     redirect_stdout(log), redirect_stderr(log):
@@ -68,6 +69,7 @@ class ExperimentIntegrationTests(unittest.TestCase):
                 self.assertAlmostEqual(radius, level * expected_mean)
                 self.assertAlmostEqual(float(row["pgd_step_size"]), radius / 8)
                 self.assertEqual(row["metric"], "feature-space PGD accuracy")
+                self.assertEqual(row["cross_entropy"], experiment.LOSS_IMPLEMENTATION)
                 self.assertLessEqual(float(row["pgd_accuracy"]), float(row["clean_accuracy"]))
                 if level == 0:
                     self.assertEqual(row["pgd_accuracy"], row["clean_accuracy"])
@@ -93,6 +95,7 @@ class ExperimentIntegrationTests(unittest.TestCase):
             with (result_dir / "experiment.json").open() as stream:
                 metadata = json.load(stream)
             self.assertEqual(metadata["feature_metadata"], experiment.FEATURE_METADATA)
+            self.assertEqual(metadata["cross_entropy"], experiment.LOSS_IMPLEMENTATION)
             self.assertEqual(metadata["mean_test_norm"], expected_mean)
 
 

@@ -7,6 +7,16 @@ The model uses ImageNet weights.
 SNR adds a squared spectral-norm penalty to the clean cross-entropy loss.
 SAA and SNR use the same initial weights, minibatch order, and Adam settings for each seed.
 
+All methods use the corrected hard-target cross-entropy from
+[A Fix for Softmax and Cross-Entropy, v3, Section 2](https://arxiv.org/html/2610.31642v3).
+This includes the inner samplers, PGD attacks, and loss measurements.
+The loss keeps small target gradients when the classifier has high confidence.
+The equations, labels, and loss reductions are unchanged.
+The loss module also has the paper's corrected softmax and log-softmax.
+Its Section 3 loss accepts raw teacher logits and fixes soft-target cancellation.
+This separate helper treats the teacher as fixed and supports first-order gradients.
+The CIFAR-10 experiment uses integer labels and does not call this helper.
+
 Use Python 3.12.
 The CPU tests passed with Python 3.12.3 and the package versions in `requirements.txt`.
 
@@ -27,13 +37,14 @@ The CPU tests passed with Python 3.12.3 and the package versions in `requirement
 
    On Linux or macOS, use `source .venv/bin/activate` to activate the environment.
 
-3. Run the CPU smoke tests.
+3. Run the smoke tests.
 
    ```text
    python CIFAR10_feature_regression/Multiclass_classification.py --smoke-test
    ```
 
    The tests use small synthetic inputs. They do not download data or model weights.
+   They run on the CPU and include a small CUDA check when CUDA is available.
    They check SNR, PGD, feature extraction, cache reuse, plots, and the full experiment procedure.
    These tests do not measure classifier quality on CIFAR-10.
 
@@ -74,6 +85,7 @@ Each run creates a separate directory under `results/cifar10_resnet18/`.
 The directory contains `results.csv`, `experiment.json`, head checkpoints, and PDF plots.
 The CSV has one row per method, configuration, seed, and perturbation level.
 It records clean accuracy, PGD accuracy, radii, and training settings.
+The `cross_entropy` field records the correction version in the CSV and run metadata.
 For SNR, it also records the final clean training CE, spectral penalty, total objective, and operator norm.
 The `spectral_penalty` column is the squared operator norm before multiplication by `snr_lambda`.
 
