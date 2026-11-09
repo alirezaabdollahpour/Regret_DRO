@@ -38,26 +38,30 @@ class ExperimentIntegrationTests(unittest.TestCase):
                 num_workers=0, output_dir=temp, methods=list(experiment.METHODS),
                 epochs=1, batch_size=4, seeds=[2022], sdro_lambdas=[10.0],
                 sdro_epsilons=[0.02, 0.002], snr_lambda=0.01, pgd_steps=10,
+                snrfrob_gamma=0.1, snrfrob_gamma_grid=None, validation_fraction=0.2,
+                validation_seed=2022, match_clean_tolerance=0.5,
             )
             with mock.patch.object(experiment, "load_or_extract_features", return_value=data), \
                     mock.patch("torch.nn.functional.cross_entropy", side_effect=AssertionError("Standard CE was called")), \
                     mock.patch.object(experiment, "train_saa", wraps=experiment.train_saa) as saa, \
                     mock.patch.object(experiment, "train_snr", wraps=experiment.train_snr) as snr, \
+                    mock.patch.object(experiment, "train_snrfrob", wraps=experiment.train_snrfrob) as frobenius, \
                     redirect_stdout(log), redirect_stderr(log):
                 result_dir = experiment.run_experiment(args)
             self.assertEqual(saa.call_count, 1)
             self.assertEqual(snr.call_count, 1)
+            self.assertEqual(frobenius.call_count, 1)
             with (result_dir / "results.csv").open(newline="") as stream:
                 rows = list(csv.DictReader(stream))
-            self.assertEqual(len(rows), 13 * 11)
+            self.assertEqual(len(rows), 14 * 11)
             counts = Counter(row["method"] for row in rows)
-            self.assertEqual(counts, {"SAA": 11, "SNR": 11, "WRM": 11,
+            self.assertEqual(counts, {"SAA": 11, "SNR": 11, "SNRFrob": 11, "WRM": 11,
                                       "Dual": 22, "WGF": 22, "WFR": 22,
                                       "SVG": 22, "RGO": 22})
             checkpoints = {row["checkpoint"] for row in rows}
-            self.assertEqual(len(checkpoints), 13)
-            self.assertEqual(len(list(result_dir.rglob("final.pth"))), 13)
-            self.assertEqual(len(list(result_dir.rglob("*_epoch_1.pth"))), 13)
+            self.assertEqual(len(checkpoints), 14)
+            self.assertEqual(len(list(result_dir.rglob("final.pth"))), 14)
+            self.assertEqual(len(list(result_dir.rglob("*_epoch_1.pth"))), 14)
             self.assertEqual(len(list(result_dir.rglob("*.pdf"))), 4)
             unique_rows = {(row["method"], row["configuration"], row["seed"],
                             row["relative_level"]) for row in rows}
@@ -74,7 +78,7 @@ class ExperimentIntegrationTests(unittest.TestCase):
                 if level == 0:
                     self.assertEqual(row["pgd_accuracy"], row["clean_accuracy"])
                 self.assertTrue((result_dir / row["checkpoint"]).is_file())
-                if row["method"] in ("SAA", "SNR"):
+                if row["method"] in experiment.CLEAN_METHODS:
                     self.assertEqual(float(row["learning_rate"]), 0.001)
                     self.assertEqual(float(row["weight_decay"]), 0.0)
                     self.assertEqual(row["epsilon"], "")
@@ -85,6 +89,13 @@ class ExperimentIntegrationTests(unittest.TestCase):
                     self.assertAlmostEqual(float(row["weighted_spectral_penalty"]), 0.01 * penalty)
                     self.assertAlmostEqual(float(row["total_objective"]),
                                            float(row["clean_ce"]) + 0.01 * penalty)
+                if row["method"] == "SNRFrob":
+                    penalty = float(row["frobenius_penalty"])
+                    self.assertEqual(float(row["snrfrob_gamma"]), 0.1)
+                    self.assertEqual(row["snr_lambda"], "")
+                    self.assertAlmostEqual(float(row["final_frobenius_norm"]) ** 2, penalty)
+                    self.assertAlmostEqual(float(row["weighted_frobenius_penalty"]), 0.1 * penalty)
+                    self.assertAlmostEqual(float(row["total_objective"]), float(row["clean_ce"]) + 0.1 * penalty)
             snr_row = next(row for row in rows if row["method"] == "SNR")
             saved = torch.load(result_dir / snr_row["checkpoint"], weights_only=True)
             head = experiment.LogisticRegression()

@@ -587,9 +587,11 @@ class WRM(BaseLinearDRO):
 
 
 def _train_clean_head(model, train_loader, epochs, learning_rate, checkpoint_dir,
-                      run_id, device, method, snr_lambda=0.0):
+                      run_id, device, method, snr_lambda=0.0, snrfrob_gamma=0.0):
     if not math.isfinite(snr_lambda) or snr_lambda < 0:
         raise ValueError("snr_lambda must be finite and nonnegative.")
+    if not math.isfinite(snrfrob_gamma) or snrfrob_gamma < 0:
+        raise ValueError("snrfrob_gamma must be finite and nonnegative.")
     device = DEVICE if device is None else torch.device(device)
     model.to(device).train()
     Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
@@ -607,6 +609,9 @@ def _train_clean_head(model, train_loader, epochs, learning_rate, checkpoint_dir
                 W = model.linear.weight
                 op_norm_sq = torch.linalg.eigvalsh(W @ W.T)[-1]
                 loss = clean_ce + snr_lambda * op_norm_sq
+            elif method == "SNRFrob":
+                frobenius_norm_sq = model.linear.weight.square().sum()
+                loss = clean_ce + snrfrob_gamma * frobenius_norm_sq
             if not torch.isfinite(loss):
                 raise ValueError(f"Nonfinite {method} training objective.")
             loss.backward()
@@ -629,6 +634,13 @@ def train_snr(model, train_loader, epochs=30, learning_rate=0.001,
               checkpoint_dir='checkpoints', run_id=0, device=None, snr_lambda=0.01):
     return _train_clean_head(model, train_loader, epochs, learning_rate,
                              checkpoint_dir, run_id, device, "SNR", snr_lambda)
+
+
+def train_snrfrob(model, train_loader, epochs=30, learning_rate=0.001,
+                  checkpoint_dir='checkpoints', run_id=0, device=None, snrfrob_gamma=0.01):
+    return _train_clean_head(model, train_loader, epochs, learning_rate,
+                             checkpoint_dir, run_id, device, "SNRFrob",
+                             snrfrob_gamma=snrfrob_gamma)
 
 
 def evaluate_model(model, test_features, test_labels, epsilon_list, pgd_steps=10,
@@ -654,8 +666,9 @@ def evaluate_model(model, test_features, test_labels, epsilon_list, pgd_steps=10
     return results
 
 
-def clean_objective_metrics(model, features, labels, snr_lambda, batch_size=128):
-    """Measure the final SNR objective on all clean training embeddings."""
+def clean_objective_metrics(model, features, labels, snr_lambda, batch_size=128,
+                            snrfrob_gamma=None):
+    """Measure the final clean objective on the embeddings used to fit the head."""
     device = next(model.parameters()).device
     model.eval()
     ce_sum = 0.0
@@ -665,11 +678,58 @@ def clean_objective_metrics(model, features, labels, snr_lambda, batch_size=128)
                                                   reduction="sum").item()
         W = model.linear.weight
         penalty = torch.linalg.eigvalsh(W @ W.T)[-1].item()
+        frobenius_penalty = W.square().sum().item()
     clean_ce = ce_sum / len(labels)
+    if snrfrob_gamma is not None:
+        return {"clean_ce": clean_ce, "frobenius_penalty": frobenius_penalty,
+                "weighted_frobenius_penalty": snrfrob_gamma * frobenius_penalty,
+                "total_objective": clean_ce + snrfrob_gamma * frobenius_penalty,
+                "final_op_norm": math.sqrt(max(penalty, 0.0)),
+                "final_frobenius_norm": math.sqrt(frobenius_penalty)}
     return {"clean_ce": clean_ce, "spectral_penalty": penalty,
             "weighted_spectral_penalty": snr_lambda * penalty,
             "total_objective": clean_ce + snr_lambda * penalty,
             "final_op_norm": math.sqrt(max(penalty, 0.0))}
+
+
+def stratified_split_indices(labels, validation_fraction, seed):
+    """Split training indices with a local RNG and at least one item per class in each set."""
+    if not math.isfinite(validation_fraction) or not 0 < validation_fraction < 1:
+        raise ValueError("validation_fraction must be between zero and one.")
+    if labels.ndim != 1 or len(labels) == 0:
+        raise ValueError("Training labels must be a nonempty vector.")
+    labels = labels.cpu()
+    generator = torch.Generator().manual_seed(seed)
+    fit_parts, validation_parts = [], []
+    for label in labels.unique(sorted=True):
+        indices = torch.nonzero(labels == label, as_tuple=True)[0]
+        if len(indices) < 2:
+            raise ValueError("Each class needs at least two training examples for a holdout.")
+        indices = indices[torch.randperm(len(indices), generator=generator)]
+        count = max(1, min(len(indices) - 1, round(len(indices) * validation_fraction)))
+        validation_parts.append(indices[:count])
+        fit_parts.append(indices[count:])
+    fit_indices, validation_indices = torch.cat(fit_parts), torch.cat(validation_parts)
+    fit_indices = fit_indices[torch.randperm(len(fit_indices), generator=generator)]
+    validation_indices = validation_indices[torch.randperm(len(validation_indices), generator=generator)]
+    return fit_indices, validation_indices
+
+
+def select_matched_gamma(reference_accuracies, candidate_accuracies):
+    """Select by the absolute gap of mean validation clean accuracies; break ties by gamma."""
+    if not reference_accuracies or not candidate_accuracies:
+        raise ValueError("Reference and candidate validation accuracies must not be empty.")
+    for gamma, accuracies in candidate_accuracies.items():
+        if not math.isfinite(gamma) or gamma < 0:
+            raise ValueError("Gamma values must be finite and nonnegative.")
+        if set(accuracies) != set(reference_accuracies):
+            raise ValueError("SNR and every gamma candidate must use the same seeds.")
+    for accuracies in [reference_accuracies, *candidate_accuracies.values()]:
+        if any(not math.isfinite(value) or not 0 <= value <= 100 for value in accuracies.values()):
+            raise ValueError("Validation clean accuracies must be finite percentages in [0, 100].")
+    reference_mean = float(np.mean(list(reference_accuracies.values())))
+    return min(candidate_accuracies, key=lambda gamma: (
+        abs(float(np.mean(list(candidate_accuracies[gamma].values()))) - reference_mean), gamma))
 
 
 FEATURE_METADATA = {
@@ -794,14 +854,16 @@ def plot_comparison(records, methods, levels, radii, output_dir):
     plt.close(fig)
 
 
-METHODS = ("SAA", "SNR", "Dual", "WGF", "WRM", "WFR", "SVG", "RGO")
+CLEAN_METHODS = ("SAA", "SNR", "SNRFrob")
+METHODS = (*CLEAN_METHODS, "Dual", "WGF", "WRM", "WFR", "SVG", "RGO")
 CSV_FIELDS = ["method", "configuration", "seed", "mean_test_norm", "relative_level",
               "absolute_radius", "clean_accuracy", "pgd_accuracy", "metric",
               "cross_entropy",
-              "snr_lambda", "lambda_param", "epsilon", "learning_rate", "batch_size",
+              "snr_lambda", "snrfrob_gamma", "lambda_param", "epsilon", "learning_rate", "batch_size",
               "epochs", "weight_decay", "pgd_steps", "pgd_step_size", "clean_ce",
               "spectral_penalty", "weighted_spectral_penalty", "total_objective",
-              "final_op_norm", "hyperparameters", "checkpoint"]
+              "final_op_norm", "frobenius_penalty", "weighted_frobenius_penalty",
+              "final_frobenius_norm", "hyperparameters", "checkpoint"]
 
 
 def configuration_id(method, hyperparameters):
@@ -809,7 +871,105 @@ def configuration_id(method, hyperparameters):
     return method + "_" + hashlib.sha256(encoded).hexdigest()[:12]
 
 
+def train_clean_configuration(method, features, labels, seed, hp, directory, device):
+    """Give each clean configuration the same initial head and minibatch order per seed."""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    head = LogisticRegression()
+    loader = DataLoader(TensorDataset(features, labels), batch_size=hp["batch_size"],
+                        shuffle=True, generator=torch.Generator().manual_seed(seed))
+    trainers = {"SAA": train_saa, "SNR": train_snr, "SNRFrob": train_snrfrob}
+    extra = {}
+    if method == "SNR":
+        extra["snr_lambda"] = hp["snr_lambda"]
+    elif method == "SNRFrob":
+        extra["snrfrob_gamma"] = hp["snrfrob_gamma"]
+    losses = trainers[method](head, loader, epochs=hp["epochs"], learning_rate=hp["learning_rate"],
+                              checkpoint_dir=directory, run_id=seed, device=device, **extra)
+    return head, losses
+
+
+def run_validation_sweep(args, fit_features, fit_labels, validation_features,
+                          validation_labels, run_dir, device, clean_hp):
+    """Select gamma on training holdout data and retain the same heads for final evaluation."""
+    mean_validation_norm = torch.linalg.vector_norm(validation_features, dim=1).mean().item()
+    levels = [k * 0.008 for k in range(11)]
+    radii = [q * mean_validation_norm for q in levels]
+    fields = ["mean_validation_norm" if name == "mean_test_norm" else name for name in CSV_FIELDS]
+    candidates = []
+    with (run_dir / "validation_results.csv").open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        configurations = [("SNR", None)] + [("SNRFrob", gamma) for gamma in sorted(args.snrfrob_gamma_grid)]
+        for seed in args.seeds:
+            for method, gamma in configurations:
+                hp = {**clean_hp, **({"snr_lambda": args.snr_lambda} if method == "SNR"
+                                     else {"snrfrob_gamma": gamma})}
+                config = configuration_id(method, hp)
+                directory = run_dir / "validation" / config / f"seed_{seed}"
+                directory.mkdir(parents=True)
+                head, losses = train_clean_configuration(
+                    method, fit_features, fit_labels, seed, hp, directory, device)
+                diagnostics = clean_objective_metrics(
+                    head, fit_features, fit_labels, args.snr_lambda, args.batch_size,
+                    snrfrob_gamma=gamma)
+                results = evaluate_model(head, validation_features, validation_labels, radii,
+                                         args.pgd_steps, args.batch_size)
+                checkpoint = directory / "validation.pth"
+                torch.save({"state_dict": head.state_dict(), "method": method, "seed": seed,
+                            "configuration": config, "hyperparameters": hp,
+                            "feature_metadata": FEATURE_METADATA, "loss_history": losses,
+                            "diagnostics": diagnostics, "mean_validation_norm": mean_validation_norm,
+                            "pgd_steps": args.pgd_steps, "validation_results": results}, checkpoint)
+                for q, radius in zip(levels, radii):
+                    row = {"method": method, "configuration": config, "seed": seed,
+                           "mean_validation_norm": mean_validation_norm, "relative_level": q,
+                           "absolute_radius": radius, "clean_accuracy": results[0.0],
+                           "pgd_accuracy": results[radius], "metric": "feature-space PGD accuracy",
+                           "pgd_steps": args.pgd_steps, "pgd_step_size": radius / 8,
+                           "hyperparameters": json.dumps(hp, sort_keys=True),
+                           "checkpoint": str(checkpoint.relative_to(run_dir)), **diagnostics}
+                    row.update({key: value for key, value in hp.items() if key in fields})
+                    writer.writerow(row)
+                stream.flush()
+                candidates.append({"method": method, "seed": seed, "hp": hp, "head": head,
+                                   "losses": losses, "directory": directory, "clean_accuracy": results[0.0]})
+    reference = {r["seed"]: r["clean_accuracy"] for r in candidates if r["method"] == "SNR"}
+    accuracies = {gamma: {r["seed"]: r["clean_accuracy"] for r in candidates
+                         if r["method"] == "SNRFrob" and r["hp"]["snrfrob_gamma"] == gamma}
+                  for gamma in args.snrfrob_gamma_grid}
+    selected_gamma = select_matched_gamma(reference, accuracies)
+    reference_mean = float(np.mean(list(reference.values())))
+    candidate_means = {gamma: float(np.mean(list(values.values()))) for gamma, values in accuracies.items()}
+    signed_gap = candidate_means[selected_gamma] - reference_mean
+    selection = {
+        "criterion": "minimum_absolute_gap_in_mean_validation_clean_accuracy",
+        "tie_breaker": "smaller_gamma", "selected_gamma": selected_gamma,
+        "snr_lambda": args.snr_lambda, "seeds": args.seeds,
+        "reference_mean_clean_accuracy": reference_mean,
+        "candidate_mean_clean_accuracies": candidate_means,
+        "selected_mean_clean_accuracy": candidate_means[selected_gamma],
+        "signed_clean_accuracy_gap_pp": signed_gap, "absolute_clean_accuracy_gap_pp": abs(signed_gap),
+        "match_tolerance_pp": args.match_clean_tolerance,
+        "matched_within_tolerance": abs(signed_gap) <= args.match_clean_tolerance,
+        "mean_validation_norm": mean_validation_norm,
+        "validation_fraction": args.validation_fraction, "validation_seed": args.validation_seed,
+        "fit_size": len(fit_labels), "validation_size": len(validation_labels),
+        "selection_uses_test_data": False, "refit_on_full_training_data": False,
+    }
+    with (run_dir / "validation_selection.json").open("w") as stream:
+        json.dump(selection, stream, indent=2)
+    print(f"Selected SNRFrob gamma={selected_gamma:g}; validation clean gap={signed_gap:+.4f} percentage points.")
+    if not selection["matched_within_tolerance"]:
+        print("The closest candidate is outside the clean-accuracy tolerance. Expand the gamma grid for a closer match.")
+    retained = {(r["method"], r["seed"]): r for r in candidates if r["method"] == "SNR" or
+                r["hp"]["snrfrob_gamma"] == selected_gamma}
+    return retained, selection
+
+
 def run_experiment(args):
+    if args.snrfrob_gamma_grid and not {"SNR", "SNRFrob"}.issubset(args.methods):
+        raise ValueError("A validation gamma sweep requires both SNR and SNRFrob.")
     if args.device == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA was requested but is not available.")
     device = DEVICE if args.device == "auto" else torch.device(args.device)
@@ -817,20 +977,44 @@ def run_experiment(args):
     data = load_or_extract_features(args.cache, args.data_dir, device,
                                     args.feature_batch_size, args.num_workers)
     train_features, train_labels = data["train_features"], data["train_labels"]
+    run_dir = Path(args.output_dir) / (datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid4().hex[:8])
+    run_dir.mkdir(parents=True, exist_ok=False)
+    print(f"Outputs: {run_dir.resolve()}")
+    split_hp = {}
+    retained, selection = {}, None
+    if args.snrfrob_gamma_grid:
+        fit_indices, validation_indices = stratified_split_indices(
+            train_labels, args.validation_fraction, args.validation_seed)
+        validation_features, validation_labels = train_features[validation_indices], train_labels[validation_indices]
+        train_features, train_labels = train_features[fit_indices], train_labels[fit_indices]
+        split_hp = {"training_split": "stratified_fit", "validation_fraction": args.validation_fraction,
+                    "validation_seed": args.validation_seed, "fit_size": len(fit_indices),
+                    "validation_size": len(validation_indices), "split_file": "validation_split.pth"}
+        torch.save({"fit_indices": fit_indices, "validation_indices": validation_indices,
+                    "feature_metadata": FEATURE_METADATA, **split_hp}, run_dir / "validation_split.pth")
+    clean_hp = {"optimizer": "Adam", "learning_rate": 0.001, "batch_size": args.batch_size,
+                "epochs": args.epochs, "weight_decay": 0.0, "betas": [0.9, 0.999],
+                "adam_eps": 1e-8, "bias": True, "feature_dim": 512, "num_classes": 10,
+                "cross_entropy": LOSS_IMPLEMENTATION, **split_hp}
+    print(f"Paired clean-head settings: {json.dumps(clean_hp, sort_keys=True)}")
+    if args.snrfrob_gamma_grid:
+        retained, selection = run_validation_sweep(
+            args, train_features, train_labels, validation_features, validation_labels,
+            run_dir, device, clean_hp)
+
+    # Test data enter the computation only after the validation choice is fixed.
     test_features, test_labels = data["test_features"], data["test_labels"]
     mean_test_norm = torch.linalg.vector_norm(test_features, dim=1).mean().item()
     levels = [k * 0.008 for k in range(11)]
     radii = [q * mean_test_norm for q in levels]
     print(f"Full clean test mean feature norm: {mean_test_norm:.9g}")
-    run_dir = Path(args.output_dir) / (datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid4().hex[:8])
-    run_dir.mkdir(parents=True, exist_ok=False)
-    print(f"Outputs: {run_dir.resolve()}")
     with (run_dir / "experiment.json").open("w") as stream:
         json.dump({"arguments": vars(args), "feature_metadata": FEATURE_METADATA,
                    "cross_entropy": LOSS_IMPLEMENTATION,
                    "mean_test_norm": mean_test_norm, "levels": levels,
+                   "validation_selection": selection,
                    "metric": "feature-space PGD accuracy",
-                   "snr_diagnostics": "final full-training clean CE; spectral_penalty is ||W||_op squared"},
+                   "clean_head_diagnostics": "final fit-data CE; penalties are unweighted squared weight norms"},
                   stream, indent=2)
 
     records = []
@@ -843,8 +1027,9 @@ def run_experiment(args):
                 raise ValueError(f"Nonfinite trained parameters for {method}, seed {seed}.")
             config = configuration_id(method, hp)
             diagnostics = (clean_objective_metrics(head, train_features, train_labels,
-                                                   args.snr_lambda, args.batch_size)
-                           if method == "SNR" else {})
+                                                   args.snr_lambda, args.batch_size,
+                                                   snrfrob_gamma=hp.get("snrfrob_gamma"))
+                           if method in ("SNR", "SNRFrob") else {})
             results = evaluate_model(head, test_features, test_labels, radii,
                                      args.pgd_steps, args.batch_size)
             checkpoint = checkpoint_dir / "final.pth"
@@ -852,6 +1037,7 @@ def run_experiment(args):
                         "configuration": config, "hyperparameters": hp,
                         "feature_metadata": FEATURE_METADATA, "mean_test_norm": mean_test_norm,
                         "loss_history": losses, "diagnostics": diagnostics,
+                        "validation_selection": selection,
                         "pgd_steps": args.pgd_steps, "results": results}, checkpoint)
             for q, radius in zip(levels, radii):
                 row = {"method": method, "configuration": config, "seed": seed,
@@ -867,31 +1053,22 @@ def run_experiment(args):
             records.append({"method": method, "hyperparameters": hp, "seed": seed,
                             "losses": losses, "results": results})
 
-        clean_hp = {"optimizer": "Adam", "learning_rate": 0.001, "batch_size": args.batch_size,
-                    "epochs": args.epochs, "weight_decay": 0.0, "betas": [0.9, 0.999],
-                    "adam_eps": 1e-8, "bias": True, "feature_dim": 512, "num_classes": 10,
-                    "cross_entropy": LOSS_IMPLEMENTATION}
-        print(f"Paired SAA/SNR settings: {json.dumps(clean_hp, sort_keys=True)}")
-        # Each seed has one initial head and independent, identically seeded loaders.
         for seed in args.seeds:
-            torch.manual_seed(seed)
-            np.random.seed(seed)
-            initial_state = LogisticRegression().state_dict()
-            for method in (m for m in args.methods if m in ("SAA", "SNR")):
+            for method in (m for m in args.methods if m in CLEAN_METHODS):
+                if (method, seed) in retained:
+                    fitted = retained[(method, seed)]
+                    finish_head(method, fitted["head"], fitted["hp"], seed,
+                                fitted["losses"], fitted["directory"])
+                    continue
                 hp = dict(clean_hp)
                 if method == "SNR":
                     hp["snr_lambda"] = args.snr_lambda
+                elif method == "SNRFrob":
+                    hp["snrfrob_gamma"] = args.snrfrob_gamma
                 directory = run_dir / configuration_id(method, hp) / f"seed_{seed}"
                 directory.mkdir(parents=True)
-                head = LogisticRegression()
-                head.load_state_dict(initial_state)
-                loader = DataLoader(TensorDataset(train_features, train_labels),
-                                    batch_size=args.batch_size, shuffle=True,
-                                    generator=torch.Generator().manual_seed(seed))
-                trainer = train_saa if method == "SAA" else train_snr
-                extra = {} if method == "SAA" else {"snr_lambda": args.snr_lambda}
-                losses = trainer(head, loader, epochs=args.epochs, learning_rate=0.001,
-                                 checkpoint_dir=directory, run_id=seed, device=device, **extra)
+                head, losses = train_clean_configuration(
+                    method, train_features, train_labels, seed, hp, directory, device)
                 finish_head(method, head, hp, seed, losses, directory)
 
         classes = {"Dual": SDRO_Dual, "WGF": SDRO_WGF, "WRM": WRM,
@@ -918,7 +1095,7 @@ def run_experiment(args):
                           "weight_decay": 0.0 if method == "Dual" else 1e-4,
                           "betas": [0.9, 0.999], "adam_eps": 1e-8,
                           "bias": True, "feature_dim": 512, "num_classes": 10,
-                          "cross_entropy": LOSS_IMPLEMENTATION}
+                          "cross_entropy": LOSS_IMPLEMENTATION, **split_hp}
                     for seed in args.seeds:
                         torch.manual_seed(seed)
                         np.random.seed(seed)
@@ -929,10 +1106,10 @@ def run_experiment(args):
                                              checkpoint_dir=str(directory), run_id=seed)
                         finish_head(method, wrapper.model, hp, seed, losses, directory)
 
-    has_dro = any(m not in ("SAA", "SNR") for m in args.methods)
+    has_dro = any(m not in CLEAN_METHODS for m in args.methods)
     plot_sweeps = [(lam, eps) for lam in args.sdro_lambdas for eps in args.sdro_epsilons] if has_dro else [(None, None)]
     for lam, eps in plot_sweeps:
-        selected = [r for r in records if r["method"] in ("SAA", "SNR") or
+        selected = [r for r in records if r["method"] in CLEAN_METHODS or
                     (r["hyperparameters"]["lambda_param"] == lam and
                      (r["method"] == "WRM" or r["hyperparameters"]["epsilon"] == eps))]
         directory = run_dir / "plots" / f"lambda_{lam}_epsilon_{eps}"
@@ -963,11 +1140,28 @@ def positive_float(value):
     return parsed
 
 
+def fraction_float(value):
+    parsed = positive_float(value)
+    if parsed >= 1:
+        raise argparse.ArgumentTypeError("must be between zero and one")
+    return parsed
+
+
 def main():
     parser = argparse.ArgumentParser(description="CIFAR-10 linear heads in one frozen ResNet-18 feature space.")
     parser.add_argument("--methods", default="all", help="Comma-separated methods, or all (default).")
     parser.add_argument("--snr-lambda", type=nonnegative_float, default=0.01,
                         help="Fixed SNR coefficient; no automatic selection (default: 0.01).")
+    frobenius = parser.add_mutually_exclusive_group()
+    frobenius.add_argument("--snrfrob-gamma", type=nonnegative_float, default=0.01,
+                           help="Fixed squared Frobenius penalty coefficient (default: 0.01).")
+    frobenius.add_argument("--snrfrob-gamma-grid", type=nonnegative_float, nargs="+",
+                           help="Match SNR validation clean accuracy over this gamma grid; requires SNR,SNRFrob.")
+    parser.add_argument("--validation-fraction", type=fraction_float, default=0.2,
+                        help="Training holdout fraction used only for a gamma grid (default: 0.2).")
+    parser.add_argument("--validation-seed", type=int, default=2022)
+    parser.add_argument("--match-clean-tolerance", type=nonnegative_float, default=0.5,
+                        help="Report a clean-accuracy match within this many percentage points (default: 0.5).")
     parser.add_argument("--epochs", type=positive_int, default=10)
     parser.add_argument("--batch-size", type=positive_int, default=128)
     parser.add_argument("--seeds", type=int, nargs="+", default=[2022])
@@ -994,11 +1188,13 @@ def main():
         parser.error(f"--methods must contain members of {METHODS}, or all")
     if len(set(args.methods)) != len(args.methods):
         parser.error("--methods must not contain duplicates")
+    if args.snrfrob_gamma_grid and not {"SNR", "SNRFrob"}.issubset(args.methods):
+        parser.error("--snrfrob-gamma-grid requires both SNR and SNRFrob in --methods")
     if args.num_workers < 0:
         parser.error("--num-workers must be nonnegative")
-    if any(seed < 0 or seed >= 2**32 for seed in args.seeds):
-        parser.error("--seeds must be in [0, 2**32)")
-    for values in (args.seeds, args.sdro_lambdas, args.sdro_epsilons):
+    if any(seed < 0 or seed >= 2**32 for seed in [*args.seeds, args.validation_seed]):
+        parser.error("Training and validation seeds must be in [0, 2**32)")
+    for values in (args.seeds, args.sdro_lambdas, args.sdro_epsilons, args.snrfrob_gamma_grid or []):
         if len(set(values)) != len(values):
             parser.error("Seed and sweep lists must not contain duplicates")
     run_experiment(args)
