@@ -48,7 +48,7 @@ The CPU tests passed with Python 3.12.3 and the package versions in `requirement
 
    The tests use small synthetic inputs. They do not download data or model weights.
    They run on the CPU and include a small CUDA check when CUDA is available.
-   They check the clean-head penalties, validation selection, PGD, feature extraction, cache reuse, and plots.
+   They check the clean-head penalties, class subsets, validation selection, PGD, feature extraction, cache reuse, and plots.
    These tests do not measure classifier quality on CIFAR-10.
 
 4. Run a quick SAA/SNR comparison.
@@ -81,7 +81,7 @@ The CPU tests passed with Python 3.12.3 and the package versions in `requirement
 
    Change `--snrfrob-gamma` to test another fixed coefficient. It must be nonnegative.
    Its default value is `0.01`. A value of zero gives the SAA objective.
-   This mode trains on the full training set. It does not select gamma from validation data.
+   This mode trains on all training samples from the selected classes. It does not select gamma from validation data.
    Remove `!` when you use the command in a terminal.
 
 7. Select gamma to match SNR's validation clean accuracy.
@@ -91,7 +91,7 @@ The CPU tests passed with Python 3.12.3 and the package versions in `requirement
    ```
 
    Grid mode requires both `SNR` and `SNRFrob`. Do not combine the grid with `--snrfrob-gamma`.
-   The script reserves 20% of the training data for validation, with the same class proportions.
+   The script reserves 20% of the selected training data for validation, with the same class proportions.
    All methods train on the same remaining 80%. The split is fixed by `--validation-seed`.
    SNR and each gamma candidate use the same initial head and minibatch order for each seed.
    The script selects one gamma with the smallest absolute gap between the mean validation clean accuracies.
@@ -106,6 +106,43 @@ The CPU tests passed with Python 3.12.3 and the package versions in `requirement
    It does not refit them on the full training set.
    Compare these heads within the same run, because earlier fixed-coefficient runs used more training data.
 
+8. Compare class subsets with the same settings and seeds.
+
+   ```text
+   python CIFAR10_feature_regression/Multiclass_classification.py --methods all --classes 1 2 --epochs 10 --seeds 2022 2023 2024 --pgd-steps 10
+   python CIFAR10_feature_regression/Multiclass_classification.py --methods all --classes 1 2 3 --epochs 10 --seeds 2022 2023 2024 --pgd-steps 10
+   ```
+
+   `--classes` takes space-separated original CIFAR-10 labels from `0` to `9`.
+   Supply at least two distinct labels. Duplicates and invalid labels are rejected.
+   Omit this option to use all ten classes.
+   Labels `1`, `2`, and `3` are automobile, bird, and cat.
+   The script sorts the selected labels and maps them to contiguous targets starting at zero.
+   Thus, `--classes 2 1` and `--classes 1 2` both map `1` to `0` and `2` to `1`.
+
+   Each method trains a head with exactly one output per selected class.
+   The feature dimension stays at 512.
+   Training uses only the selected training samples. Clean evaluation and PGD use only the selected test samples.
+   A gamma grid splits the selected training samples into fit and validation sets before training.
+   Test samples are not used to select gamma.
+
+   To run one method, use its name in `--methods`. For example:
+
+   ```text
+   python CIFAR10_feature_regression/Multiclass_classification.py --methods SNR --classes 1 2 --epochs 10 --snr-lambda 0.01 --seeds 2022 2023 2024 --pgd-steps 10
+   ```
+
+   Class selection also works with validation selection:
+
+   ```text
+   python CIFAR10_feature_regression/Multiclass_classification.py --methods "SAA,SNR,SNRFrob" --classes 1 2 3 --epochs 10 --snr-lambda 2.0 --snrfrob-gamma-grid 0 0.001 0.01 0.1 0.3 1 2 --validation-fraction 0.2 --validation-seed 2022 --seeds 2022 2023 2024 --pgd-steps 10
+   ```
+
+   Changing the class count also changes class identity and the total sample count.
+   With fixed epochs and batch size, it can change the number of optimizer updates.
+   These runs measure sensitivity to class subsets; they do not isolate output dimension alone.
+   Keep settings and seeds fixed across comparisons, and compare several class sets at each class count.
+
 Run all commands from the repository directory.
 The script uses CUDA when it is available. Otherwise, it uses the CPU.
 Add `--device cpu` to select the CPU.
@@ -114,15 +151,20 @@ Use `--help` to show all options.
 
 The metric is **feature-space PGD accuracy**, in percent.
 PGD changes the extracted features. It does not change image pixels.
-Each radius equals a relative level times the mean norm of all clean test features.
-All methods use the same radii. The default attack uses 10 steps and a clean start.
+Each L2 radius equals a relative level times the mean norm of the selected clean test features.
+All methods in a run use the same radii. The default attack uses 10 steps and a clean start.
 In grid mode, validation attacks use the mean norm of the validation features.
-Final test attacks use the mean norm of the full clean test set.
+Absolute radii can differ between class subsets. Use the recorded radii when comparing attacks across runs.
 
 Each run creates a separate directory under `results/cifar10_resnet18/`.
 The directory contains `results.csv`, `experiment.json`, head checkpoints, and PDF plots.
 The CSV has one row per method, configuration, seed, and perturbation level.
 It records clean accuracy, PGD accuracy, radii, and training settings.
+The `selected_classes` column is a JSON list of original labels; `num_classes` is the head output count.
+The `train_size`, `fit_size`, `validation_size`, and `test_size` columns record the selected sample counts.
+`train_size` counts training samples before any holdout; `fit_size` counts samples used to train the head.
+The run metadata and final checkpoints also record the class selection, original-to-target `label_mapping`, and sample counts.
+The CSV `hyperparameters` field includes this mapping. Class selection is part of the configuration identifier.
 The `cross_entropy` field records the correction version in the CSV and run metadata.
 For SNR, it also records the final clean training CE, spectral penalty, total objective, and operator norm.
 The `spectral_penalty` column is the squared operator norm before multiplication by `snr_lambda`.
@@ -133,14 +175,17 @@ The CSV also records its clean CE and total objective on the data used to train 
 
 Grid mode also saves these files:
 
-- `validation_results.csv`: SNR and all gamma candidates, for each seed and validation attack level.
+- `validation_results.csv`: SNR and all gamma candidates, for each seed and validation attack level. It includes class selection and training counts, without a test count.
 - `validation_selection.json`: the selected gamma, selection rule, accuracy gaps, and tolerance check.
-- `validation_split.pth`: the training and validation indices.
+- `validation_split.pth`: the fit and validation indices in the original full training feature cache, with `index_space="full_training_feature_cache"` and the class mapping.
 - `validation/`: the candidate checkpoints.
 
 The final `results.csv` contains the selected SNRFrob model, SNR, and the other requested methods.
 
 The default feature cache is `cifar10_resnet18_imagenet1k_v1_features.pth`.
+It always contains all ten classes with their original labels.
+Class selection filters the loaded tensors and does not modify this cache.
+The first cache build still extracts the full training and test sets, so later subsets can reuse it.
 The script rejects a cache with incompatible metadata or tensor contents.
 Use `--cache PATH` to select another cache file.
 Data, feature caches, checkpoints, and experiment results are not included in Git.

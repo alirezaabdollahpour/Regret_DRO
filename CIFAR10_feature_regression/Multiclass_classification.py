@@ -732,6 +732,37 @@ def select_matched_gamma(reference_accuracies, candidate_accuracies):
         abs(float(np.mean(list(candidate_accuracies[gamma].values()))) - reference_mean), gamma))
 
 
+def normalize_class_ids(classes):
+    """Use a fixed label order for each CIFAR-10 class subset."""
+    classes = list(classes)
+    if any(type(label) is not int or not 0 <= label < 10 for label in classes):
+        raise ValueError("--classes must contain integer CIFAR-10 labels in [0, 9].")
+    if len(classes) < 2:
+        raise ValueError("--classes must contain at least two labels.")
+    if len(set(classes)) != len(classes):
+        raise ValueError("--classes must not contain duplicates.")
+    return sorted(classes)
+
+
+def select_class_subset(features, labels, classes):
+    """Filter in cache order and return contiguous labels and original row indices."""
+    classes = normalize_class_ids(classes)
+    if features.ndim != 2 or labels.ndim != 1 or len(features) != len(labels):
+        raise ValueError("Features and labels must have matching sample counts.")
+    if labels.dtype != torch.long or features.device != labels.device:
+        raise ValueError("Labels must be torch.long and on the same device as features.")
+    if not ((labels >= 0) & (labels < 10)).all():
+        raise ValueError("Labels must be original CIFAR-10 IDs in [0, 9].")
+    missing = [label for label in classes if not (labels == label).any()]
+    if missing:
+        raise ValueError(f"Selected classes have no samples in this split: {missing}.")
+    mapping = torch.full((10,), -1, dtype=torch.long, device=labels.device)
+    mapping[classes] = torch.arange(len(classes), device=labels.device)
+    mapped_labels = mapping[labels]
+    indices = torch.nonzero(mapped_labels >= 0, as_tuple=True)[0]
+    return features[indices], mapped_labels[indices], indices
+
+
 FEATURE_METADATA = {
     "schema_version": 1,
     "dataset": "CIFAR10",
@@ -856,7 +887,8 @@ def plot_comparison(records, methods, levels, radii, output_dir):
 
 CLEAN_METHODS = ("SAA", "SNR", "SNRFrob")
 METHODS = (*CLEAN_METHODS, "Dual", "WGF", "WRM", "WFR", "SVG", "RGO")
-CSV_FIELDS = ["method", "configuration", "seed", "mean_test_norm", "relative_level",
+CSV_FIELDS = ["method", "configuration", "seed", "selected_classes", "num_classes",
+              "train_size", "fit_size", "validation_size", "test_size", "mean_test_norm", "relative_level",
               "absolute_radius", "clean_accuracy", "pgd_accuracy", "metric",
               "cross_entropy",
               "snr_lambda", "snrfrob_gamma", "lambda_param", "epsilon", "learning_rate", "batch_size",
@@ -875,7 +907,7 @@ def train_clean_configuration(method, features, labels, seed, hp, directory, dev
     """Give each clean configuration the same initial head and minibatch order per seed."""
     torch.manual_seed(seed)
     np.random.seed(seed)
-    head = LogisticRegression()
+    head = LogisticRegression(input_dim=hp["feature_dim"], num_classes=hp["num_classes"])
     loader = DataLoader(TensorDataset(features, labels), batch_size=hp["batch_size"],
                         shuffle=True, generator=torch.Generator().manual_seed(seed))
     trainers = {"SAA": train_saa, "SNR": train_snr, "SNRFrob": train_snrfrob}
@@ -895,7 +927,8 @@ def run_validation_sweep(args, fit_features, fit_labels, validation_features,
     mean_validation_norm = torch.linalg.vector_norm(validation_features, dim=1).mean().item()
     levels = [k * 0.008 for k in range(11)]
     radii = [q * mean_validation_norm for q in levels]
-    fields = ["mean_validation_norm" if name == "mean_test_norm" else name for name in CSV_FIELDS]
+    fields = ["mean_validation_norm" if name == "mean_test_norm" else name
+              for name in CSV_FIELDS if name != "test_size"]
     candidates = []
     with (run_dir / "validation_results.csv").open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
@@ -930,6 +963,7 @@ def run_validation_sweep(args, fit_features, fit_labels, validation_features,
                            "hyperparameters": json.dumps(hp, sort_keys=True),
                            "checkpoint": str(checkpoint.relative_to(run_dir)), **diagnostics}
                     row.update({key: value for key, value in hp.items() if key in fields})
+                    row["selected_classes"] = json.dumps(hp["selected_classes"])
                     writer.writerow(row)
                 stream.flush()
                 candidates.append({"method": method, "seed": seed, "hp": hp, "head": head,
@@ -943,6 +977,8 @@ def run_validation_sweep(args, fit_features, fit_labels, validation_features,
     candidate_means = {gamma: float(np.mean(list(values.values()))) for gamma, values in accuracies.items()}
     signed_gap = candidate_means[selected_gamma] - reference_mean
     selection = {
+        "selected_classes": clean_hp["selected_classes"],
+        "label_mapping": clean_hp["label_mapping"], "num_classes": clean_hp["num_classes"],
         "criterion": "minimum_absolute_gap_in_mean_validation_clean_accuracy",
         "tie_breaker": "smaller_gamma", "selected_gamma": selected_gamma,
         "snr_lambda": args.snr_lambda, "seeds": args.seeds,
@@ -968,6 +1004,10 @@ def run_validation_sweep(args, fit_features, fit_labels, validation_features,
 
 
 def run_experiment(args):
+    selected_classes = normalize_class_ids(getattr(args, "classes", range(10)))
+    class_hp = {"selected_classes": selected_classes, "num_classes": len(selected_classes),
+                "label_mapping": {str(label): index for index, label in enumerate(selected_classes)}}
+    use_subset = selected_classes != list(range(10))
     if args.snrfrob_gamma_grid and not {"SNR", "SNRFrob"}.issubset(args.methods):
         raise ValueError("A validation gamma sweep requires both SNR and SNRFrob.")
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -977,25 +1017,34 @@ def run_experiment(args):
     data = load_or_extract_features(args.cache, args.data_dir, device,
                                     args.feature_batch_size, args.num_workers)
     train_features, train_labels = data["train_features"], data["train_labels"]
+    train_indices = torch.arange(len(train_labels))
+    if use_subset:
+        train_features, train_labels, train_indices = select_class_subset(
+            train_features, train_labels, selected_classes)
+    train_size = len(train_labels)
+    print(f"Selected CIFAR-10 classes: {selected_classes}; label mapping: {class_hp['label_mapping']}")
     run_dir = Path(args.output_dir) / (datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid4().hex[:8])
     run_dir.mkdir(parents=True, exist_ok=False)
     print(f"Outputs: {run_dir.resolve()}")
-    split_hp = {}
+    split_hp = {"train_size": train_size, "fit_size": train_size, "validation_size": 0}
     retained, selection = {}, None
     if args.snrfrob_gamma_grid:
         fit_indices, validation_indices = stratified_split_indices(
             train_labels, args.validation_fraction, args.validation_seed)
         validation_features, validation_labels = train_features[validation_indices], train_labels[validation_indices]
         train_features, train_labels = train_features[fit_indices], train_labels[fit_indices]
-        split_hp = {"training_split": "stratified_fit", "validation_fraction": args.validation_fraction,
+        split_hp = {"train_size": train_size, "training_split": "stratified_fit", "validation_fraction": args.validation_fraction,
                     "validation_seed": args.validation_seed, "fit_size": len(fit_indices),
                     "validation_size": len(validation_indices), "split_file": "validation_split.pth"}
-        torch.save({"fit_indices": fit_indices, "validation_indices": validation_indices,
-                    "feature_metadata": FEATURE_METADATA, **split_hp}, run_dir / "validation_split.pth")
+        torch.save({"fit_indices": train_indices[fit_indices],
+                    "validation_indices": train_indices[validation_indices],
+                    "index_space": "full_training_feature_cache",
+                    "feature_metadata": FEATURE_METADATA, **class_hp, **split_hp},
+                   run_dir / "validation_split.pth")
     clean_hp = {"optimizer": "Adam", "learning_rate": 0.001, "batch_size": args.batch_size,
                 "epochs": args.epochs, "weight_decay": 0.0, "betas": [0.9, 0.999],
-                "adam_eps": 1e-8, "bias": True, "feature_dim": 512, "num_classes": 10,
-                "cross_entropy": LOSS_IMPLEMENTATION, **split_hp}
+                "adam_eps": 1e-8, "bias": True, "feature_dim": 512,
+                "cross_entropy": LOSS_IMPLEMENTATION, **class_hp, **split_hp}
     print(f"Paired clean-head settings: {json.dumps(clean_hp, sort_keys=True)}")
     if args.snrfrob_gamma_grid:
         retained, selection = run_validation_sweep(
@@ -1004,12 +1053,17 @@ def run_experiment(args):
 
     # Test data enter the computation only after the validation choice is fixed.
     test_features, test_labels = data["test_features"], data["test_labels"]
+    if use_subset:
+        test_features, test_labels, _ = select_class_subset(test_features, test_labels, selected_classes)
     mean_test_norm = torch.linalg.vector_norm(test_features, dim=1).mean().item()
     levels = [k * 0.008 for k in range(11)]
     radii = [q * mean_test_norm for q in levels]
-    print(f"Full clean test mean feature norm: {mean_test_norm:.9g}")
+    print(f"Samples: {len(train_labels)} fit, {split_hp['validation_size']} validation, {len(test_labels)} test")
+    print(f"Selected clean test mean feature norm: {mean_test_norm:.9g}")
     with (run_dir / "experiment.json").open("w") as stream:
         json.dump({"arguments": vars(args), "feature_metadata": FEATURE_METADATA,
+                   **class_hp, **split_hp, "test_size": len(test_labels),
+                   "radius_normalization": "mean_clean_feature_norm_of_selected_split",
                    "cross_entropy": LOSS_IMPLEMENTATION,
                    "mean_test_norm": mean_test_norm, "levels": levels,
                    "validation_selection": selection,
@@ -1036,11 +1090,13 @@ def run_experiment(args):
             torch.save({"state_dict": head.state_dict(), "method": method, "seed": seed,
                         "configuration": config, "hyperparameters": hp,
                         "feature_metadata": FEATURE_METADATA, "mean_test_norm": mean_test_norm,
+                        "test_size": len(test_labels),
                         "loss_history": losses, "diagnostics": diagnostics,
                         "validation_selection": selection,
                         "pgd_steps": args.pgd_steps, "results": results}, checkpoint)
             for q, radius in zip(levels, radii):
                 row = {"method": method, "configuration": config, "seed": seed,
+                       "test_size": len(test_labels),
                        "mean_test_norm": mean_test_norm, "relative_level": q,
                        "absolute_radius": radius, "clean_accuracy": results[0.0],
                        "pgd_accuracy": results[radius], "metric": "feature-space PGD accuracy",
@@ -1048,6 +1104,7 @@ def run_experiment(args):
                        "hyperparameters": json.dumps(hp, sort_keys=True),
                        "checkpoint": str(checkpoint.relative_to(run_dir)), **diagnostics}
                 row.update({key: value for key, value in hp.items() if key in CSV_FIELDS})
+                row["selected_classes"] = json.dumps(hp["selected_classes"])
                 writer.writerow(row)
             stream.flush()
             records.append({"method": method, "hyperparameters": hp, "seed": seed,
@@ -1094,14 +1151,14 @@ def run_experiment(args):
                     hp = {**params, "epochs": args.epochs, "optimizer": "Adam",
                           "weight_decay": 0.0 if method == "Dual" else 1e-4,
                           "betas": [0.9, 0.999], "adam_eps": 1e-8,
-                          "bias": True, "feature_dim": 512, "num_classes": 10,
-                          "cross_entropy": LOSS_IMPLEMENTATION, **split_hp}
+                          "bias": True, "feature_dim": 512,
+                          "cross_entropy": LOSS_IMPLEMENTATION, **class_hp, **split_hp}
                     for seed in args.seeds:
                         torch.manual_seed(seed)
                         np.random.seed(seed)
                         directory = run_dir / configuration_id(method, hp) / f"seed_{seed}"
                         directory.mkdir(parents=True)
-                        wrapper = classes[method](512, 10, device=device.type, **params)
+                        wrapper = classes[method](512, len(selected_classes), device=device.type, **params)
                         losses = wrapper.fit(train_features.numpy(), train_labels.numpy(),
                                              checkpoint_dir=str(directory), run_id=seed)
                         finish_head(method, wrapper.model, hp, seed, losses, directory)
@@ -1150,6 +1207,9 @@ def fraction_float(value):
 def main():
     parser = argparse.ArgumentParser(description="CIFAR-10 linear heads in one frozen ResNet-18 feature space.")
     parser.add_argument("--methods", default="all", help="Comma-separated methods, or all (default).")
+    parser.add_argument("--classes", type=int, nargs="+", choices=range(10), default=list(range(10)),
+                        help="Original CIFAR-10 labels, e.g. --classes 1 2 3. Use at least two distinct labels; "
+                             "sorted IDs map to 0..K-1 in a K-output head (default: all ten).")
     parser.add_argument("--snr-lambda", type=nonnegative_float, default=0.01,
                         help="Fixed SNR coefficient; no automatic selection (default: 0.01).")
     frobenius = parser.add_mutually_exclusive_group()
@@ -1176,6 +1236,10 @@ def main():
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--smoke-test", action="store_true", help="Run synthetic tests without downloads; check CUDA if available.")
     args = parser.parse_args()
+    try:
+        args.classes = normalize_class_ids(args.classes)
+    except ValueError as error:
+        parser.error(str(error))
     if args.smoke_test:
         import unittest
         suite = unittest.defaultTestLoader.discover(str(Path(__file__).parent),
